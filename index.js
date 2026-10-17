@@ -64,7 +64,24 @@ const petKb = (prefix) => ik(chunk(Object.entries(PETS).map(([k, v]) => ({ text:
 const MAX_PROBLEM = 500;
 
 const adminIds = (env) => String(env.ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
-const isAdmin = (env, id) => adminIds(env).includes(String(id));
+// ── Доступ администраторов по паролю ──
+// Пароль: секрет ADMIN_PASSWORD (по умолчанию 1234). При смене пароля все входы сбрасываются.
+const adminPassword = (env) => String(env.ADMIN_PASSWORD || '1234');
+async function passHash(env) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('vet:' + adminPassword(env)));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+async function isAdmin(env, id) {
+  if (adminIds(env).includes(String(id))) return true;
+  const r = await env.DB.prepare('SELECT 1 FROM admins WHERE tg_id=? AND pw_hash=?').bind(id, await passHash(env)).first();
+  return !!r;
+}
+// Все, кому слать уведомления: вошедшие по паролю + ADMIN_IDS
+async function adminChats(env) {
+  const rows = (await env.DB.prepare('SELECT tg_id FROM admins WHERE pw_hash=?').bind(await passHash(env)).all()).results;
+  return [...new Set([...adminIds(env).filter((x) => x !== '0'), ...rows.map((r) => String(r.tg_id))])];
+}
+const MAX_LOGIN_TRIES = 5, LOCK_MINUTES = 10;
 
 // ───────────────────────── Telegram API ─────────────────────────
 
@@ -165,11 +182,8 @@ async function clientWelcome(env, chatId) {
     `🐾 <b>${esc(env.CLINIC_NAME || 'Ветеринарная клиника')}</b>\n\n` +
     `Здравствуйте! Здесь можно записаться на приём к врачу в пару нажатий.\n\n` +
     `Нажмите «📅 Записаться на приём».` + clinicFooter(env);
-  if (env.LOGO_URL) {
-    const r = await tg(env, 'client', 'sendPhoto', { chat_id: chatId, photo: env.LOGO_URL, caption, parse_mode: 'HTML', reply_markup: CLIENT_MENU });
-    if (r.ok) return;
-  }
-  await send(env, 'client', chatId, caption, CLIENT_MENU);
+  // Приветствие закрепляется вверху чата
+  await sendPinned(env, 'client', chatId, caption, CLIENT_MENU, env.LOGO_URL);
 }
 
 async function doctorListView(env) {
@@ -244,7 +258,7 @@ async function myBookings(env, uid, chatId) {
 }
 
 async function notifyAdmins(env, text, kb) {
-  for (const id of adminIds(env)) await send(env, 'admin', id, text, kb);
+  for (const id of await adminChats(env)) await send(env, 'admin', id, text, kb);
 }
 
 const SEX = { m: 'мальчик', f: 'девочка' };
@@ -321,7 +335,19 @@ async function handleClient(env, u) {
     return send(env, 'client', u.message.chat.id, `Ваш Telegram ID: <code>${from.id}</code>`);
   }
   // В режиме одного бота администраторы попадают в админ-панель
-  if (from && singleBot(env) && isAdmin(env, from.id)) return handleAdmin(env, u);
+  if (from && singleBot(env)) {
+    const txt = (u.message?.text || '').trim();
+    if (txt === '/admin') { await setSession(env, 'admin', from.id, '', {}); return handleAdmin(env, u); }
+    if (await isAdmin(env, from.id)) return handleAdmin(env, u);
+    // идёт ввод пароля
+    if (u.message && (await getSession(env, 'admin', from.id)).state === 'a_login') {
+      const clientBtn = txt.startsWith('/') || CLIENT_MENU.keyboard.flat().some((b) => b.text === txt);
+      if (!clientBtn) return handleAdmin(env, u);
+      await setSession(env, 'admin', from.id, '', {}); // передумал входить — работаем как клиент
+    }
+  } else if (u.message && (u.message.text || '').trim() === '/admin') {
+    return send(env, 'client', u.message.chat.id, 'Панель администратора находится в отдельном боте.');
+  }
   if (u.message) {
     const m = u.message, uid = m.from.id, chatId = m.chat.id;
     const text = (m.text || '').trim();
@@ -548,10 +574,76 @@ const ADMIN_MENU = {
   keyboard: [
     [{ text: '📅 Сегодня' }, { text: '📆 Завтра' }],
     [{ text: '📝 Записать клиента' }, { text: '🔒 Закрыть / открыть время' }],
-    [{ text: '📊 Неделя' }],
+    [{ text: '📊 Неделя' }, { text: '🚪 Выйти' }],
   ],
   resize_keyboard: true,
 };
+
+const adminWelcomeText = (env) =>
+  `🩺 <b>Панель администратора — ${esc(env.CLINIC_NAME || 'клиника')}</b>\n\n` +
+  `Сюда приходят новые записи и отмены.\n` +
+  `☀️ 08:00 — записи на сегодня\n🌙 20:00 — итоги дня\n\n` +
+  `📝 Записать клиента — запись по телефону\n🔒 Закрыть / открыть время — у любого врача\n🚪 Выйти — выход из панели`;
+
+// Отправить сообщение и закрепить его вверху чата
+async function sendPinned(env, bot, chatId, text, kb, photo) {
+  let r;
+  if (photo) r = await tg(env, bot, 'sendPhoto', { chat_id: chatId, photo, caption: text, parse_mode: 'HTML', reply_markup: kb });
+  if (!r?.ok) r = await send(env, bot, chatId, text, kb);
+  if (r?.ok && r.result?.message_id) {
+    await tg(env, bot, 'unpinAllChatMessages', { chat_id: chatId });
+    await tg(env, bot, 'pinChatMessage', { chat_id: chatId, message_id: r.result.message_id, disable_notification: true });
+  }
+  return r;
+}
+
+// Вход по паролю. Возвращает true, если сообщение обработано (пользователь не админ).
+async function adminLogin(env, u, from) {
+  if (u.callback_query) {
+    await tg(env, 'admin', 'answerCallbackQuery', { callback_query_id: u.callback_query.id, text: 'Нет доступа. Напишите /start и введите пароль.', show_alert: true });
+    return;
+  }
+  const m = u.message, chatId = m.chat.id, text = (m.text || '').trim();
+  const s = await getSession(env, 'admin', from.id);
+  const now = Date.now();
+  if (s.data.lockUntil && now < s.data.lockUntil) {
+    const min = Math.ceil((s.data.lockUntil - now) / 60000);
+    return send(env, 'admin', chatId, `⛔ Слишком много неверных попыток. Попробуйте через ${min} мин.`);
+  }
+  if (s.state !== 'a_login' || text.startsWith('/')) {
+    await setSession(env, 'admin', from.id, 'a_login', { tries: s.data.tries || 0 });
+    return send(env, 'admin', chatId, `🔐 <b>Панель администратора — ${esc(env.CLINIC_NAME || 'клиника')}</b>\n\nВведите пароль:`, { remove_keyboard: true });
+  }
+  // удаляем сообщение с паролем из чата
+  await tg(env, 'admin', 'deleteMessage', { chat_id: chatId, message_id: m.message_id });
+  if (text === adminPassword(env)) {
+    await env.DB.prepare(
+      `INSERT INTO admins (tg_id, username, name, pw_hash) VALUES (?, ?, ?, ?)
+       ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username, name=excluded.name, pw_hash=excluded.pw_hash`
+    ).bind(from.id, from.username || null, [from.first_name, from.last_name].filter(Boolean).join(' ') || null, await passHash(env)).run();
+    await setSession(env, 'admin', from.id, '', {});
+    await send(env, 'admin', chatId, '✅ Пароль верный, доступ открыт.');
+    if (singleBot(env)) await tg(env, 'admin', 'setMyCommands', { commands: ADMIN_COMMANDS, scope: { type: 'chat', chat_id: chatId } });
+    return sendPinned(env, 'admin', chatId, adminWelcomeText(env), ADMIN_MENU);
+  }
+  const tries = (s.data.tries || 0) + 1;
+  if (tries >= MAX_LOGIN_TRIES) {
+    await setSession(env, 'admin', from.id, '', { tries: 0, lockUntil: now + LOCK_MINUTES * 60000 });
+    return send(env, 'admin', chatId, `❌ Неверный пароль. Доступа нет.\n\nВход заблокирован на ${LOCK_MINUTES} минут.`);
+  }
+  await setSession(env, 'admin', from.id, 'a_login', { tries });
+  return send(env, 'admin', chatId, `❌ Неверный пароль. Доступа нет.\n\nПопробуйте ещё раз (осталось попыток: ${MAX_LOGIN_TRIES - tries}).`);
+}
+
+const ADMIN_COMMANDS = [
+  { command: 'start', description: 'Панель администратора' },
+  { command: 'new', description: 'Записать клиента' },
+  { command: 'today', description: 'Записи на сегодня' },
+  { command: 'tomorrow', description: 'Записи на завтра' },
+  { command: 'week', description: 'Сводка на неделю' },
+  { command: 'slots', description: 'Закрыть / открыть время' },
+  { command: 'logout', description: 'Выйти из панели' },
+];
 
 async function daySummary(env, date) {
   const docs = await getDoctors(env);
@@ -628,14 +720,21 @@ async function adminConfirm(env, chatId, uid) {
 async function handleAdmin(env, u) {
   const from = u.message?.from || u.callback_query?.from;
   if (!from) return;
-  if (!isAdmin(env, from.id)) {
-    if (u.message) await send(env, 'admin', u.message.chat.id, `⛔ Нет доступа.\n\nВаш Telegram ID: <code>${from.id}</code>\nПередайте его разработчику, чтобы получить доступ.`);
-    if (u.callback_query) await tg(env, 'admin', 'answerCallbackQuery', { callback_query_id: u.callback_query.id, text: 'Нет доступа' });
-    return;
-  }
+  if (!(await isAdmin(env, from.id))) return adminLogin(env, u, from);
 
   if (u.message) {
     const chatId = u.message.chat.id, text = (u.message.text || '').trim();
+    if (text === '🚪 Выйти' || text === '/logout') {
+      await env.DB.prepare('DELETE FROM admins WHERE tg_id=?').bind(from.id).run();
+      await setSession(env, 'admin', from.id, '', {});
+      await tg(env, 'admin', 'unpinAllChatMessages', { chat_id: chatId });
+      if (singleBot(env)) {
+        await tg(env, 'admin', 'deleteMyCommands', { scope: { type: 'chat', chat_id: chatId } });
+        await send(env, 'client', chatId, '🚪 Вы вышли из панели администратора. Войти снова: /admin');
+        return clientWelcome(env, chatId);
+      }
+      return send(env, 'admin', chatId, '🚪 Вы вышли. Чтобы войти снова, напишите /start и введите пароль.', { remove_keyboard: true });
+    }
     const isMenu = text.startsWith('/') || ADMIN_MENU.keyboard.flat().some((b) => b.text === text);
     if (isMenu) await setSession(env, 'admin', from.id, '', {});
     else {
@@ -668,7 +767,7 @@ async function handleAdmin(env, u) {
         return adminConfirm(env, chatId, from.id);
       }
     }
-    if (text === '/start') return send(env, 'admin', chatId, `👋 Панель администратора <b>${esc(env.CLINIC_NAME || '')}</b>\n\nСюда приходят новые записи и отмены. Каждое утро — сводка на день.`, ADMIN_MENU);
+    if (text === '/start' || text === '/admin') return sendPinned(env, 'admin', chatId, adminWelcomeText(env), ADMIN_MENU);
     if (text === '📅 Сегодня' || text === '/today') return send(env, 'admin', chatId, await daySummary(env, today(env)), ADMIN_MENU);
     if (text === '📆 Завтра' || text === '/tomorrow') return send(env, 'admin', chatId, await daySummary(env, addDays(today(env), 1)), ADMIN_MENU);
     if (text === '📊 Неделя' || text === '/week') return send(env, 'admin', chatId, await weekSummary(env), ADMIN_MENU);
@@ -759,7 +858,7 @@ async function handleAdmin(env, u) {
         b.id = id;
         await edit(env, 'admin', msg, await bookingCard(env, b, `✅ <b>Клиент записан, #${id}</b>`),
           ik([[{ text: '❌ Отменить запись', callback_data: `bc:${id}` }]]));
-        for (const aid of adminIds(env)) {
+        for (const aid of await adminChats(env)) {
           if (aid !== String(from.id)) await send(env, 'admin', aid, await bookingCard(env, b, `🆕 <b>Новая запись #${id}</b>`), ik([[{ text: '❌ Отменить запись', callback_data: `bc:${id}` }]]));
         }
       }
@@ -873,22 +972,14 @@ export default {
         { command: 'pets', description: 'Мои питомцы' },
         { command: 'my', description: 'Мои записи' },
       ] });
-      const adminCommands = [
-        { command: 'start', description: 'Панель администратора' },
-        { command: 'new', description: 'Записать клиента' },
-        { command: 'today', description: 'Записи на сегодня' },
-        { command: 'tomorrow', description: 'Записи на завтра' },
-        { command: 'week', description: 'Сводка на неделю' },
-        { command: 'slots', description: 'Закрыть / открыть время' },
-      ];
       if (singleBot(env)) {
         // Админам в том же боте показываем своё меню команд
         res.adminCommands = [];
-        for (const id of adminIds(env)) {
-          if (id !== '0') res.adminCommands.push(await tg(env, 'client', 'setMyCommands', { commands: adminCommands, scope: { type: 'chat', chat_id: Number(id) } }));
+        for (const id of await adminChats(env)) {
+          res.adminCommands.push(await tg(env, 'client', 'setMyCommands', { commands: ADMIN_COMMANDS, scope: { type: 'chat', chat_id: Number(id) } }));
         }
       } else {
-        res.adminCommands = await tg(env, 'admin', 'setMyCommands', { commands: adminCommands });
+        res.adminCommands = await tg(env, 'admin', 'setMyCommands', { commands: ADMIN_COMMANDS });
       }
       return Response.json(res);
     }
