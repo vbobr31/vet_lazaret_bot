@@ -63,6 +63,16 @@ CREATE TABLE IF NOT EXISTS pets (
 );
 CREATE INDEX IF NOT EXISTS pets_owner ON pets(owner_id, active);
 
+-- Администраторы, вошедшие по паролю (pw_hash — отпечаток пароля на момент входа;
+-- после смены пароля старые входы перестают действовать)
+CREATE TABLE IF NOT EXISTS admins (
+  tg_id      INTEGER PRIMARY KEY,
+  username   TEXT,
+  name       TEXT,
+  pw_hash    TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Состояние диалога (на каком шаге пользователь)
 CREATE TABLE IF NOT EXISTS sessions (
   bot        TEXT NOT NULL,
