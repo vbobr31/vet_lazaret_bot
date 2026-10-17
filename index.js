@@ -125,8 +125,9 @@ async function setSession(env, bot, uid, state, data = {}) {
      ON CONFLICT(bot, user_id) DO UPDATE SET state=excluded.state, data=excluded.data, updated_at=excluded.updated_at`
   ).bind(bot, uid, state, JSON.stringify(data)).run();
 }
-const getDoctors = async (env) =>
-  (await env.DB.prepare('SELECT * FROM doctors WHERE active=1 ORDER BY sort, id').all()).results;
+// includeHidden = true — вместе со скрытыми (для админа и сводок); удалённые не показываются никогда
+const getDoctors = async (env, includeHidden = false) =>
+  (await env.DB.prepare(`SELECT * FROM doctors WHERE deleted=0 ${includeHidden ? '' : 'AND active=1'} ORDER BY sort, id`).all()).results;
 const getDoctor = (env, id) => env.DB.prepare('SELECT * FROM doctors WHERE id=?').bind(id).first();
 
 // Статус каждого слота врача на дату: free | booked | blocked | past
@@ -574,7 +575,8 @@ const ADMIN_MENU = {
   keyboard: [
     [{ text: '📅 Сегодня' }, { text: '📆 Завтра' }],
     [{ text: '📝 Записать клиента' }, { text: '🔒 Закрыть / открыть время' }],
-    [{ text: '📊 Неделя' }, { text: '🚪 Выйти' }],
+    [{ text: '👨‍⚕️ Врачи' }, { text: '📊 Неделя' }],
+    [{ text: '🚪 Выйти' }],
   ],
   resize_keyboard: true,
 };
@@ -642,11 +644,54 @@ const ADMIN_COMMANDS = [
   { command: 'tomorrow', description: 'Записи на завтра' },
   { command: 'week', description: 'Сводка на неделю' },
   { command: 'slots', description: 'Закрыть / открыть время' },
+  { command: 'doctors', description: 'Врачи: добавить / изменить / удалить' },
   { command: 'logout', description: 'Выйти из панели' },
 ];
 
+// ── Управление врачами ──
+const FIELD_NAMES = { name: 'ФИО', specialty: 'специальность', description: 'описание' };
+
+async function doctorsAdminView(env) {
+  const docs = await getDoctors(env, true);
+  let text = '👨‍⚕️ <b>Врачи</b>\n\n';
+  text += docs.length
+    ? docs.map((d) => `${d.active ? '✅' : '🙈'} <b>${esc(d.name)}</b> — ${esc(d.specialty)}`).join('\n') + '\n\n✅ виден клиентам · 🙈 скрыт\nНажмите на врача, чтобы изменить, скрыть или удалить.'
+    : 'Врачей пока нет.';
+  const rows = docs.map((d) => [{ text: `${d.active ? '✅' : '🙈'} ${d.name}`, callback_data: `dv:${d.id}` }]);
+  rows.push([{ text: '➕ Добавить врача', callback_data: 'dadd' }]);
+  return { text, kb: ik(rows) };
+}
+
+async function doctorCardView(env, id) {
+  const d = await env.DB.prepare('SELECT * FROM doctors WHERE id=? AND deleted=0').bind(id).first();
+  if (!d) return doctorsAdminView(env);
+  const future = await env.DB.prepare("SELECT COUNT(*) AS n FROM bookings WHERE doctor_id=? AND status='active' AND date>=?").bind(id, today(env)).first();
+  const text = `👨‍⚕️ <b>${esc(d.name)}</b>\n\nСпециальность: ${esc(d.specialty)}\nОписание: ${d.description ? esc(d.description) : '—'}\n` +
+    `Статус: ${d.active ? '✅ виден клиентам' : '🙈 скрыт от клиентов'}\nПредстоящих записей: ${future?.n || 0}`;
+  return {
+    text,
+    kb: ik([
+      [{ text: '✏️ ФИО', callback_data: `de:${id}:name` }, { text: '✏️ Специальность', callback_data: `de:${id}:specialty` }],
+      [{ text: '✏️ Описание', callback_data: `de:${id}:description` }],
+      [{ text: d.active ? '🙈 Скрыть от клиентов' : '👁 Показать клиентам', callback_data: `dt:${id}` }],
+      [{ text: '🗑 Удалить врача', callback_data: `dd:${id}` }],
+      [{ text: '◀️ К списку врачей', callback_data: 'dl' }],
+    ]),
+  };
+}
+
+async function finishAddDoctor(env, chatId, uid, data) {
+  const max = await env.DB.prepare('SELECT COALESCE(MAX(sort), 0) AS m FROM doctors').first();
+  const r = await env.DB.prepare('INSERT INTO doctors (name, specialty, description, sort) VALUES (?, ?, ?, ?) RETURNING id')
+    .bind(data.name, data.specialty, data.description || '', (max?.m || 0) + 1).first();
+  await setSession(env, 'admin', uid, '', {});
+  await send(env, 'admin', chatId, `✅ Врач добавлен: <b>${esc(data.name)}</b> — ${esc(data.specialty)}\n\nКлиенты уже видят его при записи. Расписание: ${env.WORK_START || '10:00'}–${env.WORK_END || '18:00'}.`);
+  const v = await doctorCardView(env, r.id);
+  return send(env, 'admin', chatId, v.text, v.kb);
+}
+
 async function daySummary(env, date) {
-  const docs = await getDoctors(env);
+  const docs = await getDoctors(env, true);
   let text = `📋 <b>Записи на ${fmtDate(date)}</b>\n`;
   let total = 0;
   for (const d of docs) {
@@ -762,6 +807,32 @@ async function handleAdmin(env, u) {
         await setSession(env, 'admin', from.id, 'a_problem', { ...s.data, pet_age: text });
         return askProblem(env, 'admin', chatId);
       }
+      // Добавление / редактирование врача
+      if (s.state === 'd_name') {
+        if (text.length < 3 || text.length > 80) return send(env, 'admin', chatId, 'Напишите ФИО врача (от 3 до 80 символов).');
+        await setSession(env, 'admin', from.id, 'd_spec', { name: text });
+        return send(env, 'admin', chatId, `Специальность? Например: «Терапевт», «Хирург», «УЗИ-диагностика».`);
+      }
+      if (s.state === 'd_spec') {
+        if (text.length < 2 || text.length > 60) return send(env, 'admin', chatId, 'Напишите специальность (до 60 символов).');
+        await setSession(env, 'admin', from.id, 'd_desc', { ...s.data, specialty: text });
+        return send(env, 'admin', chatId, 'Короткое описание для клиентов: чем занимается врач. Например: «Вакцинация, первичный приём».',
+          ik([[{ text: 'Без описания ➡️', callback_data: 'dskip' }]]));
+      }
+      if (s.state === 'd_desc') {
+        return finishAddDoctor(env, chatId, from.id, { ...s.data, description: text.slice(0, 200) });
+      }
+      if (s.state === 'd_edit') {
+        const { id, field } = s.data;
+        const max = field === 'description' ? 200 : field === 'name' ? 80 : 60;
+        if (!text || text.length > max) return send(env, 'admin', chatId, `Слишком длинно, до ${max} символов.`);
+        const value = field === 'description' && (text === '-' || text === '—') ? '' : text;
+        await env.DB.prepare(`UPDATE doctors SET ${field}=? WHERE id=?`).bind(value, id).run();
+        await setSession(env, 'admin', from.id, '', {});
+        await send(env, 'admin', chatId, { name: '✅ ФИО изменено.', specialty: '✅ Специальность изменена.', description: '✅ Описание изменено.' }[field]);
+        const v = await doctorCardView(env, id);
+        return send(env, 'admin', chatId, v.text, v.kb);
+      }
       if (s.state === 'a_problem') {
         await setSession(env, 'admin', from.id, 'a_confirm', { ...s.data, problem: text.slice(0, MAX_PROBLEM) });
         return adminConfirm(env, chatId, from.id);
@@ -772,6 +843,7 @@ async function handleAdmin(env, u) {
     if (text === '📆 Завтра' || text === '/tomorrow') return send(env, 'admin', chatId, await daySummary(env, addDays(today(env), 1)), ADMIN_MENU);
     if (text === '📊 Неделя' || text === '/week') return send(env, 'admin', chatId, await weekSummary(env), ADMIN_MENU);
     if (text === '🔒 Закрыть / открыть время' || text === '/slots') { const v = await adminDoctorsView(env); return send(env, 'admin', chatId, v.text, v.kb); }
+    if (text === '👨‍⚕️ Врачи' || text === '/doctors') { const v = await doctorsAdminView(env); return send(env, 'admin', chatId, v.text, v.kb); }
     if (text === '📝 Записать клиента' || text === '/new') { const v = await adminDoctorsView(env, true); return send(env, 'admin', chatId, v.text, v.kb); }
     return send(env, 'admin', chatId, 'Выберите действие в меню 👇', ADMIN_MENU);
   }
@@ -866,6 +938,51 @@ async function handleAdmin(env, u) {
   } else if (cmd === 'ano') {
     await setSession(env, 'admin', from.id, '', {});
     await edit(env, 'admin', msg, 'Запись не создана.');
+  } else if (cmd === 'dl') {
+    await setSession(env, 'admin', from.id, '', {});
+    const v = await doctorsAdminView(env); await edit(env, 'admin', msg, v.text, v.kb);
+  } else if (cmd === 'dv') {
+    const v = await doctorCardView(env, Number(a[0])); await edit(env, 'admin', msg, v.text, v.kb);
+  } else if (cmd === 'dadd') {
+    await setSession(env, 'admin', from.id, 'd_name', {});
+    await edit(env, 'admin', msg, '➕ <b>Новый врач</b>');
+    await send(env, 'admin', msg.chat.id, 'ФИО врача? Например: «Иванова Мария Сергеевна».');
+  } else if (cmd === 'dskip') {
+    const s = await getSession(env, 'admin', from.id);
+    if (s.state !== 'd_desc') alert = 'Начните заново: «👨‍⚕️ Врачи»';
+    else { await edit(env, 'admin', msg, 'Описание: —'); await finishAddDoctor(env, msg.chat.id, from.id, { ...s.data, description: '' }); }
+  } else if (cmd === 'de') {
+    const [id, field] = [Number(a[0]), a[1]];
+    if (!FIELD_NAMES[field]) alert = 'Неизвестное поле';
+    else {
+      await setSession(env, 'admin', from.id, 'd_edit', { id, field });
+      await send(env, 'admin', msg.chat.id, `Напишите новое значение: ${FIELD_NAMES[field]}.` + (field === 'description' ? '\nЧтобы убрать описание, отправьте «-».' : ''));
+    }
+  } else if (cmd === 'dt') {
+    const id = Number(a[0]);
+    await env.DB.prepare('UPDATE doctors SET active = 1 - active WHERE id=?').bind(id).run();
+    const v = await doctorCardView(env, id); await edit(env, 'admin', msg, v.text, v.kb);
+  } else if (cmd === 'dd') {
+    const id = Number(a[0]);
+    const future = await env.DB.prepare("SELECT COUNT(*) AS n FROM bookings WHERE doctor_id=? AND status='active' AND date>=?").bind(id, today(env)).first();
+    const warn = future?.n ? `\n\n⚠️ Предстоящих записей у врача: ${future.n}. Они будут отменены, клиенты получат уведомление.` : '';
+    await edit(env, 'admin', msg, `🗑 Удалить врача?${warn}\n\nИстория прошлых записей сохранится.`,
+      ik([[{ text: '❗ Да, удалить', callback_data: `ddy:${id}` }, { text: 'Нет', callback_data: `dv:${id}` }]]));
+  } else if (cmd === 'ddy') {
+    const id = Number(a[0]);
+    const future = (await env.DB.prepare("SELECT * FROM bookings WHERE doctor_id=? AND status='active' AND date>=?").bind(id, today(env)).all()).results;
+    for (const b of future) {
+      await env.DB.prepare("UPDATE bookings SET status='cancelled', cancelled_by='admin' WHERE id=?").bind(b.id).run();
+      if (b.client_tg_id) {
+        await send(env, 'client', b.client_tg_id,
+          (await bookingCard(env, { ...b, source: 'bot' }, '❌ <b>Ваша запись отменена клиникой</b>')) +
+          '\n\nК сожалению, врач больше не ведёт приём. Выберите другого врача: «📅 Записаться на приём».' + clinicFooter(env), CLIENT_MENU);
+      }
+    }
+    await env.DB.prepare('UPDATE doctors SET deleted=1, active=0 WHERE id=?').bind(id).run();
+    await env.DB.prepare('DELETE FROM blocks WHERE doctor_id=?').bind(id).run();
+    alert = `Врач удалён${future.length ? `, отменено записей: ${future.length}` : ''}`;
+    const v = await doctorsAdminView(env); await edit(env, 'admin', msg, v.text, v.kb);
   } else if (cmd === 'sall') {
     const [docId, date, mode] = [Number(a[0]), a[1], a[2]];
     if (mode === 'o') await env.DB.prepare('DELETE FROM blocks WHERE doctor_id=? AND date=?').bind(docId, date).run();
@@ -924,7 +1041,7 @@ async function eveningSummary(env) {
   const created = await env.DB.prepare("SELECT COUNT(*) AS n FROM bookings WHERE date(created_at, '+' || ? || ' minutes')=?")
     .bind(Number(env.TZ_OFFSET_MIN ?? 180), t).first();
   const tmr = await env.DB.prepare("SELECT COUNT(*) AS n FROM bookings WHERE date=? AND status='active'").bind(tm).first();
-  const docs = await getDoctors(env);
+  const docs = await getDoctors(env, true);
   const per = (await env.DB.prepare("SELECT doctor_id, COUNT(*) AS n FROM bookings WHERE date=? AND status='active' GROUP BY doctor_id").bind(t).all()).results;
   const perMap = Object.fromEntries(per.map((x) => [x.doctor_id, x.n]));
   const text =
@@ -965,6 +1082,19 @@ export default {
           url: `${url.origin}/tg/${bot}`, secret_token: env.WEBHOOK_SECRET,
           allowed_updates: ['message', 'callback_query'], drop_pending_updates: true,
         });
+      }
+      // Текст, который видно в пустом чате ДО нажатия «Старт», и короткое описание в профиле бота
+      const clinic = env.CLINIC_NAME || 'Ветеринарная клиника';
+      const contacts = [env.CLINIC_ADDRESS && `📍 ${env.CLINIC_ADDRESS}`, env.CLINIC_PHONE && `☎️ ${env.CLINIC_PHONE}`].filter(Boolean).join('\n');
+      res.clientDescription = await tg(env, 'client', 'setMyDescription', { description:
+        `🐾 ${clinic}\n\nБот для записи к ветеринарному врачу.\n\n` +
+        `• выберите врача, дату и удобное время\n• добавьте своих питомцев — в следующий раз останется только выбрать\n• получите напоминание накануне приёма\n\n` +
+        (contacts ? contacts + '\n\n' : '') + 'Нажмите «Старт», чтобы записаться 👇' });
+      res.clientShort = await tg(env, 'client', 'setMyShortDescription', { short_description:
+        `Онлайн-запись к врачу — ${clinic}` + (env.CLINIC_PHONE ? `. ☎️ ${env.CLINIC_PHONE}` : '') });
+      if (!singleBot(env)) {
+        res.adminDescription = await tg(env, 'admin', 'setMyDescription', { description:
+          `🩺 Панель администратора — ${clinic}\n\nЗаписи, сводки, расписание и врачи.\nДля входа нужен пароль. Нажмите «Старт».` });
       }
       res.clientCommands = await tg(env, 'client', 'setMyCommands', { commands: [
         { command: 'start', description: 'Главное меню' },

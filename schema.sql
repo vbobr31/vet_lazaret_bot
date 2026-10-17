@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS doctors (
   name        TEXT NOT NULL,
   specialty   TEXT NOT NULL,
   description TEXT DEFAULT '',
-  active      INTEGER NOT NULL DEFAULT 1,
+  active      INTEGER NOT NULL DEFAULT 1,   -- 0 = скрыт от клиентов
+  deleted     INTEGER NOT NULL DEFAULT 0,   -- 1 = удалён (история записей сохраняется)
   sort        INTEGER NOT NULL DEFAULT 0
 );
 
