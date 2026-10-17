@@ -68,8 +68,12 @@ const isAdmin = (env, id) => adminIds(env).includes(String(id));
 
 // ───────────────────────── Telegram API ─────────────────────────
 
+// Режим одного бота: если ADMIN_BOT_TOKEN не задан, админ-панель живёт в клиентском боте
+// и открывается только у тех, чей Telegram ID указан в ADMIN_IDS.
+const singleBot = (env) => !env.ADMIN_BOT_TOKEN || env.ADMIN_BOT_TOKEN === env.CLIENT_BOT_TOKEN;
+
 async function tg(env, bot, method, payload) {
-  const token = bot === 'client' ? env.CLIENT_BOT_TOKEN : env.ADMIN_BOT_TOKEN;
+  const token = bot === 'client' || singleBot(env) ? env.CLIENT_BOT_TOKEN : env.ADMIN_BOT_TOKEN;
   const base = env.TG_API_BASE || 'https://api.telegram.org';
   try {
     const r = await fetch(`${base}/bot${token}/${method}`, {
@@ -312,6 +316,12 @@ async function askProblem(env, bot, chatId) {
 }
 
 async function handleClient(env, u) {
+  const from = u.message?.from || u.callback_query?.from;
+  if (u.message && (u.message.text || '').trim() === '/id') {
+    return send(env, 'client', u.message.chat.id, `Ваш Telegram ID: <code>${from.id}</code>`);
+  }
+  // В режиме одного бота администраторы попадают в админ-панель
+  if (from && singleBot(env) && isAdmin(env, from.id)) return handleAdmin(env, u);
   if (u.message) {
     const m = u.message, uid = m.from.id, chatId = m.chat.id;
     const text = (m.text || '').trim();
@@ -850,8 +860,8 @@ export default {
 
     if (url.pathname === '/setup') {
       if (url.searchParams.get('key') !== env.WEBHOOK_SECRET) return new Response('forbidden', { status: 403 });
-      const res = {};
-      for (const bot of ['client', 'admin']) {
+      const res = { mode: singleBot(env) ? 'один бот (админ-панель внутри клиентского)' : 'два бота' };
+      for (const bot of singleBot(env) ? ['client'] : ['client', 'admin']) {
         res[bot] = await tg(env, bot, 'setWebhook', {
           url: `${url.origin}/tg/${bot}`, secret_token: env.WEBHOOK_SECRET,
           allowed_updates: ['message', 'callback_query'], drop_pending_updates: true,
@@ -863,13 +873,23 @@ export default {
         { command: 'pets', description: 'Мои питомцы' },
         { command: 'my', description: 'Мои записи' },
       ] });
-      res.adminCommands = await tg(env, 'admin', 'setMyCommands', { commands: [
+      const adminCommands = [
+        { command: 'start', description: 'Панель администратора' },
         { command: 'new', description: 'Записать клиента' },
         { command: 'today', description: 'Записи на сегодня' },
         { command: 'tomorrow', description: 'Записи на завтра' },
         { command: 'week', description: 'Сводка на неделю' },
         { command: 'slots', description: 'Закрыть / открыть время' },
-      ] });
+      ];
+      if (singleBot(env)) {
+        // Админам в том же боте показываем своё меню команд
+        res.adminCommands = [];
+        for (const id of adminIds(env)) {
+          if (id !== '0') res.adminCommands.push(await tg(env, 'client', 'setMyCommands', { commands: adminCommands, scope: { type: 'chat', chat_id: Number(id) } }));
+        }
+      } else {
+        res.adminCommands = await tg(env, 'admin', 'setMyCommands', { commands: adminCommands });
+      }
       return Response.json(res);
     }
 

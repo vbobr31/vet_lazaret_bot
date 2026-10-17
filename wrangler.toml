@@ -1,5 +1,5 @@
 name = "vet-lazaret-bot"
-main = "src/index.js"
+main = "index.js"
 compatibility_date = "2024-09-23"
 
 # 08:00 МСК — сводка админу на сегодня; 18:00 МСК — напоминания клиентам о завтрашнем приёме;
@@ -10,7 +10,7 @@ crons = ["0 5 * * *", "0 15 * * *", "0 17 * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "vet-lazaret-db"
-database_id = "ВСТАВЬТЕ_ID_ПОСЛЕ_wrangler_d1_create"
+database_id = "75fdf528-b75b-4f97-be53-8f6ccb89b1e0"
 
 [vars]
 CLINIC_NAME    = "Ветеринарный Лазарет"
@@ -26,7 +26,7 @@ TZ_OFFSET_MIN  = "180"             # UTC+3 (Москва/Липецк)
 
 # Секреты задаются командой, а не здесь:
 #   npx wrangler secret put CLIENT_BOT_TOKEN
-#   npx wrangler secret put ADMIN_BOT_TOKEN
+#   npx wrangler secret put ADMIN_BOT_TOKEN  (необязательно: без него админ-панель внутри клиентского бота)
 #   npx wrangler secret put WEBHOOK_SECRET
 #   npx wrangler secret put ADMIN_IDS        (Telegram ID админов через запятую)
 # или в панели Cloudflare: Worker → Settings → Variables and Secrets
